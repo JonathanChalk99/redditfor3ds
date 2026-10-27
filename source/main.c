@@ -4,7 +4,8 @@
 // POST view   top: image/GIF + title   bottom: scrollable nested comments + Back
 //
 // Controls: D-pad up/down  move / scroll     A  open post     B  back
-//           X  search      Y  clear search    L/R  page jump   START  exit
+//           X  search all of Reddit   Y  Home feed   B  leave search   L/R  jump 3 pages   START  exit
+//           SELECT / START  change Top's time range (while sorting by Top; START exits otherwise)
 // Touch:    on-screen buttons; drag the comments area to scroll.
 //
 // Data comes from your own proxy (see functions/api/[[path]].js). Put its address in
@@ -13,10 +14,12 @@
 #include <3ds.h>
 #include <citro2d.h>
 #include <citro3d.h>
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/stat.h>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -28,6 +31,7 @@
 enum { MEDIA_NONE = 0, MEDIA_PHOTO = 1, MEDIA_GIF = 2 };
 
 #define MAX_POSTS 30
+#define SEARCH_MAX_POSTS 20   // searches show the top 20 results
 #define MAX_COMMENTS 50
 #define MAX_LINE 80
 
@@ -63,10 +67,21 @@ static Comment cms[MAX_COMMENTS];
 static int cmCount = 0;
 
 static char apiBase[256] = "";
-static char subName[48] = "all";
+static char subName[200] = "all";
+static bool isHome = true;          // true while showing the adaptive Home feed
+static char homeLabel[96] = "";     // readable list of the subreddits Home is built from
+static bool prevIsHome = true;      // the feed you were in before searching, so you can go back to it
+static char prevSub[200] = "all";
 static char query[64] = "";
 static const char *sorts[] = {"hot", "new", "top", "rising"};
 static int sortIdx = 0;
+#define SORT_TOP 2                       // index of "top" in sorts[]
+static const char *tRanges[] = {"day", "week", "month", "year", "all"};   // sent to the proxy as &t=
+static int tIdx = 0;                     // which time range Top is using
+static void sortText(char *out, size_t n) {
+    if (sortIdx == SORT_TOP) snprintf(out, n, "top: %s", tRanges[tIdx]);
+    else snprintf(out, n, "%s", sorts[sortIdx]);
+}
 static char lastErr[200] = "";
 
 static C3D_RenderTarget *topT, *botT;
@@ -85,6 +100,8 @@ static int gifSrcFrames = 1, gifTotal = 0, gifLoaded = 0, gifDelayMs = 100;
 #define CARD_H 50.0f
 #define CARD_PITCH 54.0f
 #define LIST_TOP 30.0f
+#define CARDS_PER_PAGE 4     // about how many post cards fit on the top screen
+#define PAGES_PER_JUMP 3     // L/R jump this many screens of posts (fewer if the list runs out)
 
 // -------------------------------------------------------------- helpers ----
 static void initColors(void) {
@@ -98,11 +115,300 @@ static void initColors(void) {
     cBtn     = C2D_Color32(52, 55, 58, 255);
 }
 
-static void drawText(const char *s, float x, float y, float z, float scale, u32 clr) {
+static bool utf8Decode(const char *p, u32 *out) {
+    if (!p || !*p || !out) return false;
+    const unsigned char *s = (const unsigned char*)p;
+    if (s[0] < 0x80) { *out = s[0]; return true; }
+    if ((s[0] & 0xE0) == 0xC0 && s[1]) {
+        *out = ((u32)(s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+        return *out >= 0x80;
+    }
+    if ((s[0] & 0xF0) == 0xE0 && s[1] && s[2]) {
+        *out = ((u32)(s[0] & 0x0F) << 12) | ((u32)(s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        return *out >= 0x800;
+    }
+    if ((s[0] & 0xF8) == 0xF0 && s[1] && s[2] && s[3]) {
+        *out = ((u32)(s[0] & 0x07) << 18) | ((u32)(s[1] & 0x3F) << 12) |
+               ((u32)(s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        return *out >= 0x10000 && *out <= 0x10FFFF;
+    }
+    *out = 0xFFFD;
+    return false;
+}
+
+static int emojiUtf8Len(const char *p) {
+    if (!p || !*p) return 0;
+    unsigned char c = (unsigned char)*p;
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static bool isEmojiCodepoint(u32 cp) {
+    return
+        (cp >= 0x1F300 && cp <= 0x1FAFF) ||
+        (cp >= 0x2600 && cp <= 0x27BF) ||
+        cp == 0x2764 || cp == 0xFE0F;
+}
+
+/*
+ * Small built-in emoji renderer.
+ *
+ * The 3DS system font does parse UTF-8, but its glyph sheets do not contain
+ * modern emoji.  Instead of relying on a missing system glyph, draw a
+ * deliberately small set of common emoji directly with citro2d primitives.
+ *
+ * This is intentionally self-contained: no NAND font, external font, PNG,
+ * texture atlas, or SD asset is required.
+ */
+static bool drawEmojiGlyph(u32 cp, float x, float y, float z, float scale) {
+    const float sz = 28.0f * scale;
+    const float cx = x + sz * 0.50f;
+    const float cy = y + sz * 0.50f;
+    const float r = sz * 0.43f;
+
+    u32 yellow = C2D_Color32(255, 204, 0, 255);
+    u32 yellow2 = C2D_Color32(255, 221, 60, 255);
+    u32 white = C2D_Color32(255, 255, 255, 255);
+    u32 black = C2D_Color32(25, 25, 25, 255);
+    u32 red = C2D_Color32(235, 50, 65, 255);
+    u32 orange = C2D_Color32(255, 145, 25, 255);
+    u32 blue = C2D_Color32(65, 145, 235, 255);
+    u32 green = C2D_Color32(55, 190, 95, 255);
+    u32 brown = C2D_Color32(120, 75, 40, 255);
+    u32 pink = C2D_Color32(255, 125, 170, 255);
+
+    switch (cp) {
+        // 😀 😃 😄 😁 😆 😅
+        case 0x1F600: case 0x1F603: case 0x1F604:
+        case 0x1F601: case 0x1F606: case 0x1F605:
+            C2D_DrawCircleSolid(cx, cy, z, r, yellow);
+            C2D_DrawCircleSolid(cx - sz*.15f, cy - sz*.08f, z+.01f, sz*.045f, black);
+            C2D_DrawCircleSolid(cx + sz*.15f, cy - sz*.08f, z+.01f, sz*.045f, black);
+            if (cp == 0x1F605) {
+                C2D_DrawEllipseSolid(x+sz*.31f, y+sz*.61f, z+.01f, sz*.38f, sz*.12f, black);
+            } else {
+                C2D_DrawEllipseSolid(x+sz*.31f, y+sz*.59f, z+.01f, sz*.38f, sz*.17f, black);
+            }
+            return true;
+
+        // 😂
+        case 0x1F602:
+            C2D_DrawCircleSolid(cx, cy, z, r, yellow);
+            C2D_DrawCircleSolid(cx - sz*.15f, cy - sz*.08f, z+.01f, sz*.05f, black);
+            C2D_DrawCircleSolid(cx + sz*.15f, cy - sz*.08f, z+.01f, sz*.05f, black);
+            C2D_DrawEllipseSolid(x+sz*.29f, y+sz*.56f, z+.01f, sz*.42f, sz*.20f, black);
+            C2D_DrawCircleSolid(cx - sz*.36f, cy + sz*.04f, z+.01f, sz*.055f, blue);
+            C2D_DrawCircleSolid(cx + sz*.36f, cy + sz*.04f, z+.01f, sz*.055f, blue);
+            return true;
+
+        // 🤣
+        case 0x1F923:
+            C2D_DrawCircleSolid(cx, cy, z, r, yellow);
+            C2D_DrawEllipseSolid(x+sz*.28f, y+sz*.56f, z+.01f, sz*.44f, sz*.20f, black);
+            C2D_DrawLine(x+sz*.28f, y+sz*.39f, black, x+sz*.42f, y+sz*.48f, black, sz*.035f, z+.01f);
+            C2D_DrawLine(x+sz*.72f, y+sz*.39f, black, x+sz*.58f, y+sz*.48f, black, sz*.035f, z+.01f);
+            return true;
+
+        // 😊
+        case 0x1F60A:
+            C2D_DrawCircleSolid(cx, cy, z, r, yellow2);
+            C2D_DrawCircleSolid(cx - sz*.15f, cy - sz*.07f, z+.01f, sz*.04f, black);
+            C2D_DrawCircleSolid(cx + sz*.15f, cy - sz*.07f, z+.01f, sz*.04f, black);
+            C2D_DrawEllipseSolid(x+sz*.35f, y+sz*.56f, z+.01f, sz*.30f, sz*.12f, red);
+            return true;
+
+        // 😍
+        case 0x1F60D:
+            C2D_DrawCircleSolid(cx, cy, z, r, yellow);
+            C2D_DrawCircleSolid(cx - sz*.17f, cy - sz*.08f, z+.01f, sz*.07f, red);
+            C2D_DrawCircleSolid(cx + sz*.17f, cy - sz*.08f, z+.01f, sz*.07f, red);
+            C2D_DrawLine(x+sz*.12f, y+sz*.25f, red, x+sz*.22f, y+sz*.18f, red, sz*.025f, z+.01f);
+            C2D_DrawLine(x+sz*.22f, y+sz*.18f, red, x+sz*.31f, y+sz*.25f, red, sz*.025f, z+.01f);
+            C2D_DrawLine(x+sz*.69f, y+sz*.25f, red, x+sz*.78f, y+sz*.18f, red, sz*.025f, z+.01f);
+            C2D_DrawLine(x+sz*.78f, y+sz*.18f, red, x+sz*.88f, y+sz*.25f, red, sz*.025f, z+.01f);
+            return true;
+
+        // 😎
+        case 0x1F60E:
+            C2D_DrawCircleSolid(cx, cy, z, r, yellow);
+            C2D_DrawRectSolid(x+sz*.16f, y+sz*.29f, z+.01f, sz*.28f, sz*.15f, black);
+            C2D_DrawRectSolid(x+sz*.56f, y+sz*.29f, z+.01f, sz*.28f, sz*.15f, black);
+            C2D_DrawLine(x+sz*.44f, y+sz*.35f, black, x+sz*.56f, y+sz*.35f, black, sz*.035f, z+.01f);
+            C2D_DrawEllipseSolid(x+sz*.34f, y+sz*.60f, z+.01f, sz*.32f, sz*.12f, black);
+            return true;
+
+        // 😢 😭
+        case 0x1F622: case 0x1F62D:
+            C2D_DrawCircleSolid(cx, cy, z, r, yellow);
+            C2D_DrawCircleSolid(cx - sz*.15f, cy - sz*.08f, z+.01f, sz*.045f, black);
+            C2D_DrawCircleSolid(cx + sz*.15f, cy - sz*.08f, z+.01f, sz*.045f, black);
+            C2D_DrawEllipseSolid(x+sz*.37f, y+sz*.57f, z+.01f, sz*.26f, sz*.10f, black);
+            C2D_DrawEllipseSolid(x+sz*.21f, y+sz*.49f, z+.02f, sz*.09f, cp == 0x1F62D ? sz*.22f : sz*.14f, blue);
+            C2D_DrawEllipseSolid(x+sz*.70f, y+sz*.49f, z+.02f, sz*.09f, cp == 0x1F62D ? sz*.22f : sz*.14f, blue);
+            return true;
+
+        // 😡 😠
+        case 0x1F621: case 0x1F620:
+            C2D_DrawCircleSolid(cx, cy, z, r, red);
+            C2D_DrawLine(x+sz*.18f, y+sz*.29f, black, x+sz*.38f, y+sz*.36f, black, sz*.035f, z+.01f);
+            C2D_DrawLine(x+sz*.62f, y+sz*.36f, black, x+sz*.82f, y+sz*.29f, black, sz*.035f, z+.01f);
+            C2D_DrawEllipseSolid(x+sz*.34f, y+sz*.61f, z+.01f, sz*.32f, sz*.09f, black);
+            return true;
+
+        // 🤔
+        case 0x1F914:
+            C2D_DrawCircleSolid(cx, cy, z, r, yellow);
+            C2D_DrawCircleSolid(cx - sz*.15f, cy - sz*.08f, z+.01f, sz*.04f, black);
+            C2D_DrawCircleSolid(cx + sz*.15f, cy - sz*.08f, z+.01f, sz*.04f, black);
+            C2D_DrawEllipseSolid(x+sz*.38f, y+sz*.56f, z+.01f, sz*.25f, sz*.09f, black);
+            C2D_DrawLine(x+sz*.27f, y+sz*.73f, brown, x+sz*.20f, y+sz*.92f, brown, sz*.07f, z+.01f);
+            C2D_DrawLine(x+sz*.20f, y+sz*.92f, brown, x+sz*.40f, y+sz*.95f, brown, sz*.07f, z+.01f);
+            return true;
+
+        // 👍 👎
+        case 0x1F44D:
+            C2D_DrawEllipseSolid(x+sz*.34f, y+sz*.13f, z, sz*.30f, sz*.70f, yellow2);
+            C2D_DrawEllipseSolid(x+sz*.16f, y+sz*.48f, z+.01f, sz*.55f, sz*.27f, yellow2);
+            C2D_DrawRectSolid(x+sz*.43f, y+sz*.52f, z+.02f, sz*.32f, sz*.23f, yellow2);
+            return true;
+        case 0x1F44E:
+            C2D_DrawEllipseSolid(x+sz*.34f, y+sz*.28f, z, sz*.30f, sz*.65f, yellow2);
+            C2D_DrawEllipseSolid(x+sz*.17f, y+sz*.22f, z+.01f, sz*.54f, sz*.28f, yellow2);
+            return true;
+
+        // ❤️
+        case 0x2764:
+            C2D_DrawCircleSolid(x+sz*.35f, y+sz*.40f, z, sz*.20f, red);
+            C2D_DrawCircleSolid(x+sz*.65f, y+sz*.40f, z, sz*.20f, red);
+            C2D_DrawTriangle(x+sz*.10f, y+sz*.45f, red,
+                             x+sz*.90f, y+sz*.45f, red,
+                             x+sz*.50f, y+sz*.94f, red, z);
+            return true;
+
+        // 🔥
+        case 0x1F525:
+            C2D_DrawTriangle(x+sz*.50f, y+sz*.04f, orange,
+                             x+sz*.86f, y+sz*.55f, red,
+                             x+sz*.50f, y+sz*.92f, red, z);
+            C2D_DrawTriangle(x+sz*.50f, y+sz*.28f, yellow,
+                             x+sz*.70f, y+sz*.63f, yellow,
+                             x+sz*.47f, y+sz*.82f, yellow, z+.01f);
+            return true;
+
+        // 🎉
+        case 0x1F389:
+            C2D_DrawEllipseSolid(x+sz*.30f, y+sz*.28f, z, sz*.40f, sz*.45f, blue);
+            C2D_DrawTriangle(x+sz*.15f, y+sz*.75f, red,
+                             x+sz*.82f, y+sz*.20f, yellow,
+                             x+sz*.45f, y+sz*.45f, green, z+.01f);
+            C2D_DrawCircleSolid(x+sz*.78f, y+sz*.76f, z+.02f, sz*.08f, yellow);
+            return true;
+
+        // 💀
+        case 0x1F480:
+            C2D_DrawCircleSolid(cx, cy-sz*.02f, z, r*.88f, white);
+            C2D_DrawRectSolid(x+sz*.28f, y+sz*.62f, z+.01f, sz*.44f, sz*.25f, white);
+            C2D_DrawCircleSolid(x+sz*.36f, y+sz*.42f, z+.02f, sz*.10f, black);
+            C2D_DrawCircleSolid(x+sz*.64f, y+sz*.42f, z+.02f, sz*.10f, black);
+            C2D_DrawTriangle(x+sz*.46f, y+sz*.55f, black,
+                             x+sz*.54f, y+sz*.55f, black,
+                             x+sz*.50f, y+sz*.68f, black, z+.02f);
+            return true;
+
+        // 💩
+        case 0x1F4A9:
+            C2D_DrawEllipseSolid(x+sz*.23f, y+sz*.33f, z, sz*.54f, sz*.55f, brown);
+            C2D_DrawEllipseSolid(x+sz*.32f, y+sz*.20f, z+.01f, sz*.36f, sz*.34f, brown);
+            C2D_DrawCircleSolid(x+sz*.39f, y+sz*.45f, z+.02f, sz*.04f, white);
+            C2D_DrawCircleSolid(x+sz*.61f, y+sz*.45f, z+.02f, sz*.04f, white);
+            return true;
+
+        // 🚗
+        case 0x1F697:
+            C2D_DrawRectSolid(x+sz*.14f, y+sz*.45f, z, sz*.72f, sz*.28f, blue);
+            C2D_DrawTriangle(x+sz*.25f, y+sz*.45f, blue,
+                             x+sz*.38f, y+sz*.24f, blue,
+                             x+sz*.64f, y+sz*.24f, blue, z);
+            C2D_DrawCircleSolid(x+sz*.30f, y+sz*.76f, z+.01f, sz*.10f, black);
+            C2D_DrawCircleSolid(x+sz*.70f, y+sz*.76f, z+.01f, sz*.10f, black);
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+static bool emojiSequence(const char *p, u32 *cp, int *bytes) {
+    if (!utf8Decode(p, cp)) return false;
+    *bytes = emojiUtf8Len(p);
+    // Ignore variation selectors and zero-width joiners when they follow a
+    // supported base emoji. The base emoji is still rendered by our fallback.
+    return isEmojiCodepoint(*cp) && *cp != 0xFE0F;
+}
+
+static void drawPlainTextSegment(const char *s, size_t len, float *x, float y, float z, float scale, u32 clr) {
+    if (!len) return;
+    char tmp[512];
+    if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+    memcpy(tmp, s, len);
+    tmp[len] = 0;
+
     C2D_Text t;
-    C2D_TextParse(&t, textBuf, s);
+    C2D_TextParse(&t, textBuf, tmp);
     C2D_TextOptimize(&t);
-    C2D_DrawText(&t, C2D_WithColor, x, y, z, scale, scale, clr);
+    C2D_DrawText(&t, C2D_WithColor, *x, y, z, scale, scale, clr);
+
+    float w = 0.0f;
+    C2D_TextGetDimensions(&t, scale, scale, &w, NULL);
+    *x += w;
+}
+
+static void drawText(const char *s, float x, float y, float z, float scale, u32 clr) {
+    if (!s || !*s) return;
+
+    const char *run = s;
+    const char *p = s;
+
+    while (*p) {
+        u32 cp = 0;
+        int bytes = 0;
+
+        if (emojiSequence(p, &cp, &bytes)) {
+            if (p > run)
+                drawPlainTextSegment(run, (size_t)(p - run), &x, y, z, scale, clr);
+
+            float emojiSize = 28.0f * scale;
+            if (drawEmojiGlyph(cp, x, y - 1.0f * scale, z + 0.01f, scale))
+                x += emojiSize + 1.0f * scale;
+            else
+                x += emojiSize;
+
+            p += bytes;
+
+            // Variation selector U+FE0F, skin-tone modifiers and ZWJ are
+            // consumed here so they do not become stray missing-glyph boxes.
+            while (*p) {
+                u32 next = 0;
+                int nb = emojiUtf8Len(p);
+                if (!utf8Decode(p, &next)) break;
+                if (next == 0xFE0F || next == 0x200D ||
+                    (next >= 0x1F3FB && next <= 0x1F3FF)) {
+                    p += nb;
+                } else {
+                    break;
+                }
+            }
+            run = p;
+        } else {
+            p += (*p == '\n') ? 1 : emojiUtf8Len(p);
+        }
+    }
+
+    if (p > run)
+        drawPlainTextSegment(run, (size_t)(p - run), &x, y, z, scale, clr);
 }
 
 static void fmtCount(char *out, size_t n, int v) {
@@ -110,11 +416,27 @@ static void fmtCount(char *out, size_t n, int v) {
     else snprintf(out, n, "%d", v);
 }
 
+static const char *utf8Next(const char *p) {
+    if (!p || !*p) return p;
+    unsigned char c = (unsigned char)*p;
+    if (c < 0x80) return p + 1;
+    if ((c & 0xE0) == 0xC0 && p[1]) return p + 2;
+    if ((c & 0xF0) == 0xE0 && p[1] && p[2]) return p + 3;
+    if ((c & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) return p + 4;
+    return p + 1;
+}
+
+static size_t utf8Count(const char *s) {
+    size_t n = 0; while (s && *s) { s = utf8Next(s); n++; } return n;
+}
+
 static void truncated(char *out, size_t n, const char *s, size_t maxChars) {
-    if (strlen(s) <= maxChars) { snprintf(out, n, "%s", s); return; }
-    int cut = (int)maxChars - 3;
-    while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) cut--;  // don't split a UTF-8 character
-    snprintf(out, n, "%.*s...", cut, s);
+    if (utf8Count(s) <= maxChars) { snprintf(out, n, "%s", s); return; }
+    if (maxChars < 4 || n < 4) { if (n) out[0] = 0; return; }
+    size_t keep = maxChars - 3, bytes = 0; const char *p = s;
+    for (size_t i = 0; i < keep && *p; i++) { const char *q = utf8Next(p); bytes += (size_t)(q-p); p=q; }
+    if (bytes + 4 > n) bytes = n - 4;
+    memcpy(out, s, bytes); memcpy(out + bytes, "...", 4);
 }
 
 static void urlEncode(char *out, size_t n, const char *in) {
@@ -134,21 +456,14 @@ static void urlEncode(char *out, size_t n, const char *in) {
 // Greedy word wrap into fixed lines (we wrap ourselves so heights are known).
 static int wrapText(const char *s, int maxChars, char lines[][MAX_LINE], int maxLines) {
     if (maxChars > MAX_LINE - 1) maxChars = MAX_LINE - 1;
-    int n = 0;
-    const char *p = s;
+    int n = 0; const char *p = s;
     while (*p && n < maxLines) {
-        while (*p == ' ') p++;
-        if (!*p) break;
-        int i = 0, lastSpace = -1;
-        while (p[i] && i < maxChars) { if (p[i] == ' ') lastSpace = i; i++; }
-        int len;
-        if (!p[i] || p[i] == ' ') len = i;
-        else len = (lastSpace > 0) ? lastSpace : i;
-        while (len > 1 && ((unsigned char)p[len] & 0xC0) == 0x80) len--;  // don't split a UTF-8 character
-        memcpy(lines[n], p, len);
-        lines[n][len] = 0;
-        n++;
-        p += len;
+        while (*p == ' ') p++; if (!*p) break;
+        const char *q = p, *lastSpace = NULL; int chars = 0;
+        while (*q && chars < maxChars) { const char *next = utf8Next(q); if (*q == ' ') lastSpace = q; q = next; chars++; }
+        const char *end = (q < p || (*q && lastSpace)) ? (lastSpace ? lastSpace : q) : q;
+        size_t len = (size_t)(end-p); if (len >= MAX_LINE) len = MAX_LINE-1;
+        memcpy(lines[n], p, len); lines[n][len] = 0; n++; p = end; while (*p == ' ') p++;
     }
     return n;
 }
@@ -259,11 +574,13 @@ static void freePosts(void) {
 }
 
 static bool fetchPosts(void) {
-    char subE[96], qE[160], url[512];
-    urlEncode(subE, sizeof subE, subName);
+    char subE[640], qE[160], url[1024];
+    // Searches are global (all of Reddit, best matches first) and never limited to the current feed.
+    urlEncode(subE, sizeof subE, query[0] ? "all" : subName);
     urlEncode(qE, sizeof qE, query);
-    if (query[0]) snprintf(url, sizeof url, "%s/posts?sub=%s&sort=%s&q=%s", apiBase, subE, sorts[sortIdx], qE);
-    else snprintf(url, sizeof url, "%s/posts?sub=%s&sort=%s", apiBase, subE, sorts[sortIdx]);
+    const char *sortName = query[0] ? "hot" : sorts[sortIdx];  // for searches the proxy turns this into "relevance"
+    if (query[0]) snprintf(url, sizeof url, "%s/posts?sub=%s&sort=%s&q=%s", apiBase, subE, sortName, qE);
+    else snprintf(url, sizeof url, "%s/posts?sub=%s&sort=%s&t=%s", apiBase, subE, sortName, tRanges[tIdx]);
 
     u8 *buf; u32 size;
     lastErr[0] = 0;
@@ -273,7 +590,8 @@ static bool fetchPosts(void) {
 
     freePosts();
     char *line = rest;
-    while (*line && postCount < MAX_POSTS) {
+    int maxShown = query[0] ? SEARCH_MAX_POSTS : MAX_POSTS;
+    while (*line && postCount < maxShown) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
         if (line[0] == 'P' && line[1] == '\t') {
@@ -539,6 +857,9 @@ static const Button bOpen   = {214, 150, 96, 34, "Open"};
 static const Button bSearch = {10, 192, 96, 38, "Search"};
 static const Button bSub    = {112, 192, 96, 38, "Subreddit"};
 static const Button bSort   = {214, 192, 96, 38, "Sort"};
+static const Button bRefresh = {6, 2, 66, 18, "Refresh"};
+static const Button bHome   = {244, 2, 66, 18, "Home"};  // sits in the bottom screen's header strip
+static const Button bFeed   = {172, 2, 66, 18, "< Feed"}; // only shown while viewing search results
 
 static void renderListTop(float scroll, int sel) {
     C2D_TargetClear(topT, cBg);
@@ -584,11 +905,19 @@ static void renderListTop(float scroll, int sel) {
     drawText("3DS Reddit", 10, 4, 0.6f, 0.6f, cText);
     char h[96], q[40];
     if (query[0]) {
-        truncated(q, sizeof q, query, 20);
-        snprintf(h, sizeof h, "search: %s (%d)", q, postCount);
+        truncated(q, sizeof q, query, 18);
+        snprintf(h, sizeof h, "all Reddit: %s (%d)", q, postCount);
         drawText(h, 170, 8, 0.6f, 0.45f, cAccent);
     } else {
-        snprintf(h, sizeof h, "r/%s - %s", subName, sorts[sortIdx]);
+        char st[24];
+        sortText(st, sizeof st);
+        if (isHome) {
+            char lab[48];
+            truncated(lab, sizeof lab, homeLabel, 20);
+            snprintf(h, sizeof h, "Home: %s - %s", lab, st);
+        } else {
+            snprintf(h, sizeof h, "r/%s - %s", subName, st);
+        }
         drawText(h, 400 - 14 - strlen(h) * 6.2f, 8, 0.6f, 0.45f, cDim);
     }
 }
@@ -604,10 +933,10 @@ static void renderListBottom(int sel, int held) {
     if (postCount > 0) {
         const Post *p = &posts[sel];
         drawText(p->sub, 10, 3, 0.2f, 0.5f, cAccent);
-        if (lastErr[0]) {  // e.g. a failed reload: the old list stays, the error shows in the header
+        if (lastErr[0] && !query[0]) {  // e.g. a failed reload: the old list stays, the error shows in the header
             char e[40];
-            truncated(e, sizeof e, lastErr, 34);
-            drawText(e, 130, 6, 0.2f, 0.4f, C2D_Color32(255, 120, 90, 255));
+            truncated(e, sizeof e, lastErr, 22);
+            drawText(e, 112, 6, 0.2f, 0.4f, C2D_Color32(255, 120, 90, 255));
         }
 
         int n = wrapText(p->title, 40, lines, 3);
@@ -621,6 +950,9 @@ static void renderListBottom(int sel, int held) {
 
         if (p->media != MEDIA_NONE)
             drawText(p->media == MEDIA_GIF ? "[ animated GIF ]" : "[ photo ]", 12, 94, 0.3f, 0.42f, cAccent);
+        char pos[40];
+        snprintf(pos, sizeof pos, "%d/%d   L/R: %d pages", sel + 1, postCount, PAGES_PER_JUMP);
+        drawText(pos, 190, 94, 0.3f, 0.4f, cDim);
 
         n = wrapText(p->body, 46, lines, 3);
         for (int i = 0; i < n; i++) drawText(lines[i], 12, 108 + i * 12, 0.3f, 0.45f, cText);
@@ -636,9 +968,22 @@ static void renderListBottom(int sel, int held) {
     drawButton(&bSearch, held == 4, false);
     drawButton(&bSub, held == 5, false);
     char sortLabel[24];
-    snprintf(sortLabel, sizeof sortLabel, "Sort: %s", sorts[sortIdx]);
+    bool topMode = (sortIdx == SORT_TOP && !query[0]);
+    if (query[0]) snprintf(sortLabel, sizeof sortLabel, "Sort: best");
+    else if (topMode) snprintf(sortLabel, sizeof sortLabel, "Top: %s", tRanges[tIdx]);
+    else snprintf(sortLabel, sizeof sortLabel, "Sort: %s", sorts[sortIdx]);
     Button sb = bSort; sb.label = sortLabel;
-    drawButton(&sb, held == 6, false);
+    if (topMode) {
+        // two-line button: the current range plus a reminder of the shortcut keys
+        C2D_DrawRectSolid(sb.x, sb.y, 0.3f, sb.w, sb.h, held == 6 ? cAccent : cBtn);
+        drawText(sortLabel, sb.x + sb.w / 2 - strlen(sortLabel) * 3.5f, sb.y + 3, 0.4f, 0.5f, cText);
+        drawText("SELECT / START", sb.x + 11, sb.y + 21, 0.4f, 0.36f, cAccent);
+    } else {
+        drawButton(&sb, held == 6, false);
+    }
+    drawButton(&bRefresh, held == 7, false);
+    drawButton(&bHome, held == 8, isHome && !query[0]);
+    if (query[0]) drawButton(&bFeed, held == 9, true);
 }
 
 // ---- POST view
@@ -775,12 +1120,145 @@ static void loadConfig(void) {
 
 static bool configured(void) { return strstr(apiBase, "YOUR-PROJECT") == NULL; }
 
+// ------------------------------------------------------- adaptive Home feed ----
+// Home learns from what you open. Every time you open a post, its subreddit gets +1 in
+// history.txt (inside this app's own redditviewer folder). Home then shows one combined feed of
+// your most-opened subreddits ("r/a+b+c"), so it drifts toward what you actually read.
+// Old interests fade (counts are halved once the totals get large). Delete history.txt to reset.
+#define HIST_PATH CONFIG_DIR "/history.txt"
+#define MAX_HIST 40
+#define HOME_MAX_SUBS 6
+#define HOME_MIN_SUBS 3      // until you've opened posts from this many subreddits, Home is r/all
+#define HOME_MAX_CHARS 58    // keeps the combined name inside the proxy's 60-character limit
+
+typedef struct { char name[32]; int count, seq; } Interest;
+static Interest hist[MAX_HIST];
+static int histCount = 0, histSeq = 0;
+
+static bool validSubName(const char *s) {
+    size_t n = strlen(s);
+    if (n < 2 || n > 24) return false;
+    for (; *s; s++) if (!isalnum((unsigned char)*s) && *s != '_') return false;
+    return true;
+}
+
+static void saveHistory(void) {
+    if (!pathExists(CONFIG_DIR)) return;  // only ever writes inside our own folder
+    FILE *f = fopen(HIST_PATH, "w");
+    if (!f) return;
+    for (int i = 0; i < histCount; i++) fprintf(f, "%s\t%d\t%d\n", hist[i].name, hist[i].count, hist[i].seq);
+    fclose(f);
+}
+
+static void loadHistory(void) {
+    FILE *f = fopen(HIST_PATH, "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f) && histCount < MAX_HIST) {
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        *t1 = 0;
+        char *t2 = strchr(t1 + 1, '\t');
+        int count = atoi(t1 + 1), seq = t2 ? atoi(t2 + 1) : 0;
+        if (!validSubName(line) || count < 1) continue;
+        for (char *c = line; *c; c++) *c = (char)tolower((unsigned char)*c);
+        Interest *it = &hist[histCount++];
+        snprintf(it->name, sizeof it->name, "%s", line);
+        it->count = count;
+        it->seq = seq;
+        if (seq > histSeq) histSeq = seq;
+    }
+    fclose(f);
+}
+
+static void recordView(const char *prefixedSub) {
+    if (strncmp(prefixedSub, "r/", 2) != 0) return;
+    char name[32];
+    snprintf(name, sizeof name, "%s", prefixedSub + 2);
+    if (!validSubName(name)) return;
+    for (char *c = name; *c; c++) *c = (char)tolower((unsigned char)*c);
+
+    int idx = -1;
+    for (int i = 0; i < histCount; i++) if (strcmp(hist[i].name, name) == 0) { idx = i; break; }
+    if (idx < 0) {
+        if (histCount < MAX_HIST) {
+            idx = histCount++;
+        } else {  // full: replace the least-opened entry (oldest on ties)
+            idx = 0;
+            for (int i = 1; i < MAX_HIST; i++)
+                if (hist[i].count < hist[idx].count ||
+                    (hist[i].count == hist[idx].count && hist[i].seq < hist[idx].seq)) idx = i;
+        }
+        snprintf(hist[idx].name, sizeof hist[idx].name, "%s", name);
+        hist[idx].count = 0;
+    }
+    hist[idx].count++;
+    hist[idx].seq = ++histSeq;
+
+    int total = 0;
+    for (int i = 0; i < histCount; i++) total += hist[i].count;
+    if (total > 120) for (int i = 0; i < histCount; i++) hist[i].count = (hist[i].count + 1) / 2;
+
+    saveHistory();
+}
+
+// Picks the top subreddits and sets subName ("a+b+c") and homeLabel ("a, b, c").
+static void computeHome(void) {
+    bool used[MAX_HIST] = {false};
+    char combined[64] = "", label[96] = "";
+    int picked = 0;
+    while (picked < HOME_MAX_SUBS) {
+        int best = -1;
+        for (int i = 0; i < histCount; i++) {
+            if (used[i]) continue;
+            if (best < 0 || hist[i].count > hist[best].count ||
+                (hist[i].count == hist[best].count && hist[i].seq > hist[best].seq)) best = i;
+        }
+        if (best < 0) break;
+        used[best] = true;
+        size_t add = strlen(hist[best].name) + (picked ? 1 : 0);
+        if (strlen(combined) + add > HOME_MAX_CHARS) continue;  // too long, try a shorter one
+        if (picked) { strcat(combined, "+"); strcat(label, ", "); }
+        strcat(combined, hist[best].name);
+        strcat(label, hist[best].name);
+        picked++;
+    }
+    if (picked < HOME_MIN_SUBS) {
+        snprintf(subName, sizeof subName, "all");
+        snprintf(homeLabel, sizeof homeLabel, "r/all (open posts to personalize)");
+    } else {
+        snprintf(subName, sizeof subName, "%s", combined);
+        snprintf(homeLabel, sizeof homeLabel, "%s", label);
+    }
+}
+
 // Reloads the post list from the server (blocking, with a loading screen).
 static void reloadPosts(int *sel, float *scroll) {
     loadingFrame("Loading posts...");
     if (!fetchPosts() && postCount == 0) { /* lastErr already set */ }
     *sel = 0;
     *scroll = 0;
+}
+
+static void goHome(int *sel, float *scroll) {
+    isHome = true;
+    query[0] = 0;
+    computeHome();
+    reloadPosts(sel, scroll);
+    if (lastErr[0] && strchr(subName, '+')) {  // e.g. one of the subreddits is private or banned
+        snprintf(subName, sizeof subName, "all");
+        snprintf(homeLabel, sizeof homeLabel, "r/all (fallback)");
+        reloadPosts(sel, scroll);
+    }
+}
+
+// Leaves search results and returns to the feed you were in before searching.
+static void leaveSearch(int *sel, float *scroll) {
+    query[0] = 0;
+    if (prevIsHome) { goHome(sel, scroll); return; }
+    isHome = false;
+    snprintf(subName, sizeof subName, "%s", prevSub);
+    reloadPosts(sel, scroll);
 }
 
 // ----------------------------------------------------------------- main ----
@@ -796,13 +1274,14 @@ int main(void) {
     httpcInit(0);
 
     loadConfig();
+    loadHistory();
 
     int view = VIEW_LIST;
     int sel = 0;
     float listScroll = 0, cmScroll = 0;
     int lastTouchY = -1;
 
-    if (configured()) reloadPosts(&sel, &listScroll);
+    if (configured()) goHome(&sel, &listScroll);
     else snprintf(lastErr, sizeof lastErr,
                   "Server not set. Create sdmc:/3ds/redditviewer/server.txt containing your proxy address, "
                   "e.g. https://my-project.pages.dev/api");
@@ -810,7 +1289,9 @@ int main(void) {
     while (aptMainLoop()) {
         hidScanInput();
         u32 down = hidKeysDown(), held = hidKeysHeld();
-        if (down & KEY_START) break;
+        // START exits, except in the list while sorting by Top, where START/SELECT pick the time range.
+        bool rangeKeys = (view == VIEW_LIST && sortIdx == SORT_TOP && !query[0]);
+        if ((down & KEY_START) && !rangeKeys) break;
 
         touchPosition touch;
         hidTouchRead(&touch);
@@ -818,19 +1299,25 @@ int main(void) {
         int heldBtn = 0;
 
         if (view == VIEW_LIST) {
-            const Button *btns[6] = {&bPrev, &bNext, &bOpen, &bSearch, &bSub, &bSort};
+            const Button *btns[9] = {&bPrev, &bNext, &bOpen, &bSearch, &bSub, &bSort, &bRefresh, &bHome, &bFeed};
             int press = 0;
-            for (int i = 0; i < 6; i++) {
+            for (int i = 0; i < 9; i++) {
+                if (i == 8 && !query[0]) continue;  // the Feed button only exists during a search
                 if (touching && inButton(btns[i], touch.px, touch.py)) heldBtn = i + 1;
                 if ((down & KEY_TOUCH) && inButton(btns[i], touch.px, touch.py)) press = i + 1;
             }
             if ((down & KEY_UP) || press == 1) { if (sel > 0) sel--; }
             if ((down & KEY_DOWN) || press == 2) { if (sel < postCount - 1) sel++; }
-            if (down & KEY_L) { sel -= 4; if (sel < 0) sel = 0; }
-            if (down & KEY_R) { sel += 4; if (sel > postCount - 1) sel = postCount - 1; if (sel < 0) sel = 0; }
+            if (down & KEY_L) { sel -= CARDS_PER_PAGE * PAGES_PER_JUMP; if (sel < 0) sel = 0; }
+            if (down & KEY_R) {
+                sel += CARDS_PER_PAGE * PAGES_PER_JUMP;
+                if (sel > postCount - 1) sel = postCount - 1;  // not enough posts left: stop at the last one
+                if (sel < 0) sel = 0;
+            }
 
             if (((down & KEY_A) || press == 3) && postCount > 0) {
                 view = VIEW_POST;
+                recordView(posts[sel].sub);  // teach the Home feed what you read
                 cmScroll = 0;
                 lastTouchY = -1;
                 freeMedia();
@@ -842,26 +1329,36 @@ int main(void) {
             }
             if (((down & KEY_X) || press == 4) && configured()) {
                 char buf[64];
-                if (askText("Search Reddit...", query, buf, sizeof buf, 60)) {
+                if (askText("Search all of Reddit...", query, buf, sizeof buf, 60)) {
+                    bool wasSearching = query[0] != 0;
+                    if (!wasSearching && buf[0]) {  // remember the feed so "Feed" / B can return to it
+                        prevIsHome = isHome;
+                        snprintf(prevSub, sizeof prevSub, "%s", subName);
+                    }
                     snprintf(query, sizeof query, "%s", buf);
-                    reloadPosts(&sel, &listScroll);
+                    if (buf[0]) reloadPosts(&sel, &listScroll);
+                    else if (wasSearching) leaveSearch(&sel, &listScroll);  // empty search = back to the feed
                 }
             }
-            if (((down & KEY_Y) && query[0]) && configured()) {
-                query[0] = 0;
-                reloadPosts(&sel, &listScroll);
-            }
+            if (press == 7 && configured()) reloadPosts(&sel, &listScroll);
+            if (((down & KEY_Y) || press == 8) && configured()) goHome(&sel, &listScroll);
+            if (((down & KEY_B) || press == 9) && query[0] && configured()) leaveSearch(&sel, &listScroll);
             if (press == 5 && configured()) {
                 char buf[48];
                 if (askText("Subreddit (e.g. gaming), empty = all", "", buf, sizeof buf, 40)) {
                     const char *s = buf;
                     if ((s[0] == 'r' || s[0] == 'R') && s[1] == '/') s += 2;
                     snprintf(subName, sizeof subName, "%s", s[0] ? s : "all");
+                    isHome = false;
                     query[0] = 0;
                     reloadPosts(&sel, &listScroll);
                 }
             }
-            if (press == 6 && configured()) {
+            if (rangeKeys && configured() && ((down & KEY_START) || (down & KEY_SELECT))) {
+                tIdx = (tIdx + ((down & KEY_START) ? 1 : 4)) % 5;  // START = next range, SELECT = previous
+                reloadPosts(&sel, &listScroll);
+            }
+            if (press == 6 && configured() && !query[0]) {  // search results have a fixed order
                 sortIdx = (sortIdx + 1) % 4;
                 reloadPosts(&sel, &listScroll);
             }
